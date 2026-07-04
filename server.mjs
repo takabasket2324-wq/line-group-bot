@@ -44,21 +44,26 @@ app.post("/webhook", middleware(config), async (req, res) => {
 
 async function handleEvent(event) {
   if (event.type !== "message" || event.message.type !== "text") return;
-  if (event.source.type !== "group") return;
+
+  const isGroup = event.source.type === "group";
+  const isDirect = event.source.type === "user";
+  if (!isGroup && !isDirect) return; // ルーム(複数人トーク)は対象外
 
   const userId = event.source.userId;
-  const groupId = event.source.groupId;
   const text = event.message.text;
   const mention = event.message.mention;
 
-  console.log(`[message] group=${groupId} user=${userId} text="${text.slice(0, 50)}"`);
+  // スプシの履歴シートを分ける単位: グループなら groupId、個別チャットなら userId
+  const threadId = isGroup ? event.source.groupId : userId;
+
+  console.log(`[message] ${isGroup ? "group" : "direct"}=${threadId} user=${userId} text="${text.slice(0, 50)}"`);
 
   if (userId === process.env.ADMIN_USER_ID) {
     console.log("[skip] 管理者のメッセージ");
     return;
   }
 
-  if (mention && mention.mentionees) {
+  if (isGroup && mention && mention.mentionees) {
     const mentionedAdmin = mention.mentionees.some(
       (m) => m.userId === process.env.ADMIN_USER_ID
     );
@@ -74,33 +79,40 @@ async function handleEvent(event) {
     messages: [{ type: "text", text: "応答生成中..." }],
   });
 
-  // グループ名とユーザー名を取得
-  const [groupSummary, memberProfile] = await Promise.all([
-    client.getGroupSummary(groupId).catch(() => null),
-    client.getGroupMemberProfile(groupId, userId).catch(() => null),
-  ]);
-  const groupName = groupSummary?.groupName || groupId;
-  const displayName = memberProfile?.displayName || userId;
+  // スレッド名（履歴シート名）とユーザー名を取得
+  let threadName, displayName;
+  if (isGroup) {
+    const [groupSummary, memberProfile] = await Promise.all([
+      client.getGroupSummary(threadId).catch(() => null),
+      client.getGroupMemberProfile(threadId, userId).catch(() => null),
+    ]);
+    threadName = groupSummary?.groupName || threadId;
+    displayName = memberProfile?.displayName || userId;
+  } else {
+    const profile = await client.getProfile(userId).catch(() => null);
+    displayName = profile?.displayName || userId;
+    threadName = `個別-${displayName}`;
+  }
 
-  // 受講生のメッセージをスプシに記録
-  await appendHistory(groupId, groupName, userId, displayName, text);
+  // お客さまのメッセージをスプシに記録
+  await appendHistory(threadId, threadName, userId, displayName, text);
 
   // スプシから3つのデータを並列取得
   const [systemPrompt, knowledge, history] = await Promise.all([
     fetchSystemPrompt(),
     fetchKnowledge(),
-    fetchHistory(groupId, groupName, 10),
+    fetchHistory(threadId, threadName, 10),
   ]);
 
   // Claude API で回答生成
   const reply = await generateReply(text, systemPrompt, knowledge, history);
 
   // Bot の回答をスプシに記録
-  await appendHistory(groupId, groupName, "Bot", "Bot", reply);
+  await appendHistory(threadId, threadName, "Bot", "Bot", reply);
 
-  // 本回答を push message でグループに送信
+  // 本回答を push message で送信（グループでも個別チャットでも to は groupId/userId でOK）
   await client.pushMessage({
-    to: groupId,
+    to: threadId,
     messages: [{ type: "text", text: reply }],
   });
 
