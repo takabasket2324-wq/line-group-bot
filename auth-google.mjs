@@ -101,8 +101,8 @@ function waitForCallback(client) {
 
     setTimeout(() => {
       server.close();
-      reject(new Error("OAuth 認証がタイムアウトしました（5分）"));
-    }, 5 * 60 * 1000);
+      reject(new Error("OAuth 認証がタイムアウトしました（20分）"));
+    }, 20 * 60 * 1000);
   });
 }
 
