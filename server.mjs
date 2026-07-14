@@ -33,7 +33,8 @@ app.get("/", (req, res) => {
 
 // Render無料プランのコールドスタート対策用（GitHub Actions cron が定期ping）
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", bot: "line-group-bot" });
+  res.json({ status: "ok", bot: "line-group-bot", diag: true,
+    places_key: !!process.env.GOOGLE_PLACES_API_KEY });
 });
 
 app.post("/webhook", middleware(config), async (req, res) => {
