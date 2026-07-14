@@ -9,7 +9,7 @@ import { messagingApi, middleware } from "@line/bot-sdk";
 import dotenv from "dotenv";
 import { join, dirname } from "path";
 import { generateReply } from "./lib/ai.mjs";
-import { fetchSystemPrompt, fetchKnowledge, fetchHistory, appendHistory } from "./lib/sheets.mjs";
+import { fetchSystemPrompt, fetchKnowledge, fetchHistory, appendHistory, appendDiagnosisLead } from "./lib/sheets.mjs";
 import { runDiagnosis } from "./lib/diagnose.mjs";
 import { consumeDiagQuota, DIAG_DAILY_LIMIT } from "./lib/ratelimit.mjs";
 
@@ -115,9 +115,10 @@ async function handleDiagnose(event, userId, text) {
   });
 
   let resultText;
+  let diagResult = null; // 成功時のみ入る（リード名簿用）
   try {
-    const { summary } = await runDiagnosis(storeName);
-    resultText = summary;
+    diagResult = await runDiagnosis(storeName);
+    resultText = diagResult.summary;
   } catch (err) {
     console.error("[diagnose error]", err.message);
     resultText = err.message.includes("見つかりませんでした")
@@ -129,13 +130,35 @@ async function handleDiagnose(event, userId, text) {
   console.log(`[diagnose reply] user=${userId} store="${storeName}"`);
 
   // リード記録としてスプシにも残す（失敗しても診断は成功扱い）
+  const profile = await client.getProfile(userId).catch(() => null);
+  const displayName = profile?.displayName || userId;
   try {
-    const profile = await client.getProfile(userId).catch(() => null);
-    const displayName = profile?.displayName || userId;
     await appendHistory(userId, `個別-${displayName}`, userId, displayName, `診断 ${storeName}`);
     await appendHistory(userId, `個別-${displayName}`, "Bot", "Bot", resultText);
   } catch (err) {
     console.error("[diagnose history error]", err.message);
+  }
+
+  // 診断リード名簿へ1行追記（診断成功時のみ。失敗しても診断は成功扱い）
+  if (diagResult) {
+    try {
+      const { place, score, gaps } = diagResult;
+      const pct = (axis) => Math.round((score.axes[axis]?.ratio ?? 0) * 100);
+      await appendDiagnosisLead({
+        displayName,
+        userId,
+        storeName,
+        total: score.total,
+        relevancePct: pct("relevance"),
+        distancePct: pct("distance"),
+        prominencePct: pct("prominence"),
+        gaps,
+        placeId: place.placeId,
+      });
+      console.log(`[diagnose lead] user=${userId} store="${storeName}" total=${score.total}%`);
+    } catch (err) {
+      console.error("[diagnose lead error]", err.message);
+    }
   }
 }
 
