@@ -9,9 +9,13 @@ import { messagingApi, middleware } from "@line/bot-sdk";
 import dotenv from "dotenv";
 import { join, dirname } from "path";
 import { generateReply } from "./lib/ai.mjs";
-import { fetchSystemPrompt, fetchKnowledge, fetchHistory, appendHistory, appendDiagnosisLead } from "./lib/sheets.mjs";
+import { fetchSystemPrompt, fetchKnowledge, fetchHistory, appendHistory, appendDiagnosisLead, recordConsultContact } from "./lib/sheets.mjs";
 import { runDiagnosis } from "./lib/diagnose.mjs";
 import { consumeDiagQuota, DIAG_DAILY_LIMIT } from "./lib/ratelimit.mjs";
+import {
+  markAwaitingContact, isAwaitingContact, clearAwaitingContact,
+  CONSULT_ASK_CONTACT, CONSULT_THANKS, buildAdminNotify,
+} from "./lib/consult.mjs";
 
 const PROJECT_ROOT = dirname(import.meta.url.replace("file://", ""));
 dotenv.config({ path: join(PROJECT_ROOT, ".env") });
@@ -33,8 +37,9 @@ app.get("/", (req, res) => {
 
 // Render無料プランのコールドスタート対策用（GitHub Actions cron が定期ping）
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", bot: "line-group-bot", diag: true,
-    places_key: !!process.env.GOOGLE_PLACES_API_KEY });
+  res.json({ status: "ok", bot: "line-group-bot", diag: true, consult: true,
+    places_key: !!process.env.GOOGLE_PLACES_API_KEY,
+    admin_user: !!process.env.ADMIN_USER_ID });
 });
 
 app.post("/webhook", middleware(config), async (req, res) => {
@@ -103,7 +108,7 @@ async function handleDiagnose(event, userId, text) {
       replyToken: event.replyToken,
       messages: [{ type: "text", text:
         `無料診断は1日${DIAG_DAILY_LIMIT}回までとさせていただいています🙏\n` +
-        "明日また試していただくか、詳しい診断をご希望でしたらこのままご返信ください。" }],
+        "明日また試していただくか、詳しい診断をご希望でしたら『相談したい』とご返信ください。" }],
     });
     return;
   }
@@ -162,6 +167,96 @@ async function handleDiagnose(event, userId, text) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 相談ハンドオフ（1:1トーク用）
+// 「相談」を含む返信 → 連絡先を聞く → 次のメッセージを連絡先として受領
+// → スプシ「診断リード」に記録 → 社長(ADMIN_USER_ID)へpush通知
+// ※LINE公式の管理画面チャットは使えない（自動応答が止まる）ため、
+//   社長はLINE外（電話等）で連絡する運用
+// ---------------------------------------------------------------------------
+
+// 「相談」トリガー：AIの一般回答をせず、連絡先をお願いする
+async function handleConsultRequest(event, userId) {
+  markAwaitingContact(userId);
+  await client.replyMessage({
+    replyToken: event.replyToken,
+    messages: [{ type: "text", text: CONSULT_ASK_CONTACT }],
+  });
+  console.log(`[consult] 連絡先待ちに設定 user=${userId}`);
+
+  // 履歴シートにも残す（失敗しても本流は成功扱い）
+  try {
+    const profile = await client.getProfile(userId).catch(() => null);
+    const displayName = profile?.displayName || userId;
+    await appendHistory(userId, `個別-${displayName}`, userId, displayName, event.message.text);
+    await appendHistory(userId, `個別-${displayName}`, "Bot", "Bot", CONSULT_ASK_CONTACT);
+  } catch (err) {
+    console.error("[consult history error]", err.message);
+  }
+}
+
+// 「連絡先待ち」ユーザーの次のメッセージ＝連絡先として受領
+async function handleContactReceived(event, userId, text) {
+  // 「相談したい」の言い直しは連絡先ではない → もう一度お願いする
+  if (/相談/.test(text) && text.trim().length <= 12) {
+    await client.replyMessage({
+      replyToken: event.replyToken,
+      messages: [{ type: "text", text: CONSULT_ASK_CONTACT }],
+    });
+    return;
+  }
+
+  clearAwaitingContact(userId);
+
+  // ① お客さまへの受領返信（AI回答はしない）
+  await client.replyMessage({
+    replyToken: event.replyToken,
+    messages: [{ type: "text", text: CONSULT_THANKS }],
+  });
+  console.log(`[consult] 連絡先を受領 user=${userId}`);
+
+  const profile = await client.getProfile(userId).catch(() => null);
+  const displayName = profile?.displayName || userId;
+
+  // ② 診断リードシートに記録（該当行のK〜M更新／無ければ新規行）
+  let leadInfo = { storeName: "", total: "" };
+  try {
+    leadInfo = await recordConsultContact({ userId, displayName, contactText: text });
+    console.log(`[consult lead] user=${userId} existing=${leadInfo.existing}`);
+  } catch (err) {
+    console.error("[consult lead error]", err.message);
+  }
+
+  // ③ 社長のLINEへpush通知
+  const adminId = process.env.ADMIN_USER_ID;
+  if (adminId) {
+    try {
+      await client.pushMessage({
+        to: adminId,
+        messages: [{ type: "text", text: buildAdminNotify({
+          displayName,
+          storeName: leadInfo.storeName,
+          total: leadInfo.total,
+          contactText: text,
+        }) }],
+      });
+      console.log(`[consult notify] 社長へ通知済み user=${userId}`);
+    } catch (err) {
+      console.error("[consult notify error]", err.message);
+    }
+  } else {
+    console.warn("[consult] ADMIN_USER_ID未設定のため社長通知をスキップしました");
+  }
+
+  // 履歴シートにも残す
+  try {
+    await appendHistory(userId, `個別-${displayName}`, userId, displayName, text);
+    await appendHistory(userId, `個別-${displayName}`, "Bot", "Bot", CONSULT_THANKS);
+  } catch (err) {
+    console.error("[consult history error]", err.message);
+  }
+}
+
 async function handleEvent(event) {
   // 友だち追加あいさつ
   if (event.type === "follow") return handleFollow(event);
@@ -184,6 +279,18 @@ async function handleEvent(event) {
   // 無料GBP診断（1:1トークのみ）。管理者スキップより前＝社長自身も実機テストできる
   if (isDirect && /^診断/.test(text.trim())) {
     return handleDiagnose(event, userId, text);
+  }
+
+  // 相談ハンドオフ（1:1トークのみ・グループでは発動しない）
+  if (isDirect) {
+    // 連絡先待ちの人の次のメッセージ＝連絡先（AI回答しない）
+    if (isAwaitingContact(userId)) {
+      return handleContactReceived(event, userId, text);
+    }
+    // 「相談」を含む返信 → AIの一般回答をせず連絡先をお願いする
+    if (/相談/.test(text)) {
+      return handleConsultRequest(event, userId);
+    }
   }
 
   if (userId === process.env.ADMIN_USER_ID) {
