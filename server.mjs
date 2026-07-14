@@ -10,6 +10,8 @@ import dotenv from "dotenv";
 import { join, dirname } from "path";
 import { generateReply } from "./lib/ai.mjs";
 import { fetchSystemPrompt, fetchKnowledge, fetchHistory, appendHistory } from "./lib/sheets.mjs";
+import { runDiagnosis } from "./lib/diagnose.mjs";
+import { consumeDiagQuota, DIAG_DAILY_LIMIT } from "./lib/ratelimit.mjs";
 
 const PROJECT_ROOT = dirname(import.meta.url.replace("file://", ""));
 dotenv.config({ path: join(PROJECT_ROOT, ".env") });
@@ -29,6 +31,11 @@ app.get("/", (req, res) => {
   res.json({ status: "ok", bot: "line-group-bot" });
 });
 
+// Render無料プランのコールドスタート対策用（GitHub Actions cron が定期ping）
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", bot: "line-group-bot" });
+});
+
 app.post("/webhook", middleware(config), async (req, res) => {
   res.status(200).json({ status: "ok" });
 
@@ -42,7 +49,99 @@ app.post("/webhook", middleware(config), async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// 無料GBP診断（1:1トーク用）
+// ---------------------------------------------------------------------------
+
+// 友だち追加時のあいさつ（無料GBP診断への誘導）
+const FOLLOW_GREETING = [
+  "友だち追加ありがとうございます！",
+  "上田AI工房です⚙️",
+  "",
+  "🎁 ただいま「Googleビジネスプロフィール無料診断」を実施中です。",
+  "お店がGoogleマップ・Google検索でどれだけ力を発揮できているか、29項目でチェックして結果をお返しします。",
+  "",
+  "使い方はかんたん。",
+  "お店の名前を「診断 ○○店」のように送ってください。",
+  "エリア名も添えると見つかりやすいです（例：診断 ○○食堂 難波）",
+  "",
+  "※本診断は最適化度の点検で、検索順位を保証するものではありません。",
+].join("\n");
+
+// 「診断」だけ送られたときの案内
+const DIAG_GUIDE = [
+  "無料GBP診断ですね！",
+  "お店の名前を「診断 ○○店」の形で送ってください。",
+  "エリア名も添えると見つかりやすいです（例：診断 ○○食堂 難波）",
+].join("\n");
+
+async function handleFollow(event) {
+  console.log(`[follow] user=${event.source.userId}`);
+  await client.replyMessage({
+    replyToken: event.replyToken,
+    messages: [{ type: "text", text: FOLLOW_GREETING }],
+  });
+}
+
+// 「診断 ○○店」→ Places取得＋29項目採点→要約を返信
+async function handleDiagnose(event, userId, text) {
+  const storeName = text.trim().replace(/^診断/, "").trim();
+
+  // 店名なし＝使い方の案内だけ（レート消費しない）
+  if (!storeName) {
+    await client.replyMessage({
+      replyToken: event.replyToken,
+      messages: [{ type: "text", text: DIAG_GUIDE }],
+    });
+    return;
+  }
+
+  // 簡易レートリミット（1ユーザー1日3回・Places課金/API消費の暴走防止）
+  if (!consumeDiagQuota(userId)) {
+    await client.replyMessage({
+      replyToken: event.replyToken,
+      messages: [{ type: "text", text:
+        `無料診断は1日${DIAG_DAILY_LIMIT}回までとさせていただいています🙏\n` +
+        "明日また試していただくか、詳しい診断をご希望でしたらこのままご返信ください。" }],
+    });
+    return;
+  }
+
+  // すぐに受付返信（診断はPlaces API 2コールで数秒かかる）
+  await client.replyMessage({
+    replyToken: event.replyToken,
+    messages: [{ type: "text", text: `「${storeName}」を診断中です…🔎\n少々お待ちください（30秒ほど）` }],
+  });
+
+  let resultText;
+  try {
+    const { summary } = await runDiagnosis(storeName);
+    resultText = summary;
+  } catch (err) {
+    console.error("[diagnose error]", err.message);
+    resultText = err.message.includes("見つかりませんでした")
+      ? `「${storeName}」が見つかりませんでした🙏\nエリア名を添えて、もう一度送ってみてください（例：診断 ${storeName} 難波）`
+      : "診断中にエラーが発生しました🙏 時間をおいてもう一度お試しください。";
+  }
+
+  await client.pushMessage({ to: userId, messages: [{ type: "text", text: resultText }] });
+  console.log(`[diagnose reply] user=${userId} store="${storeName}"`);
+
+  // リード記録としてスプシにも残す（失敗しても診断は成功扱い）
+  try {
+    const profile = await client.getProfile(userId).catch(() => null);
+    const displayName = profile?.displayName || userId;
+    await appendHistory(userId, `個別-${displayName}`, userId, displayName, `診断 ${storeName}`);
+    await appendHistory(userId, `個別-${displayName}`, "Bot", "Bot", resultText);
+  } catch (err) {
+    console.error("[diagnose history error]", err.message);
+  }
+}
+
 async function handleEvent(event) {
+  // 友だち追加あいさつ
+  if (event.type === "follow") return handleFollow(event);
+
   if (event.type !== "message" || event.message.type !== "text") return;
 
   const isGroup = event.source.type === "group";
@@ -57,6 +156,11 @@ async function handleEvent(event) {
   const threadId = isGroup ? event.source.groupId : userId;
 
   console.log(`[message] ${isGroup ? "group" : "direct"}=${threadId} user=${userId} text="${text.slice(0, 50)}"`);
+
+  // 無料GBP診断（1:1トークのみ）。管理者スキップより前＝社長自身も実機テストできる
+  if (isDirect && /^診断/.test(text.trim())) {
+    return handleDiagnose(event, userId, text);
+  }
 
   if (userId === process.env.ADMIN_USER_ID) {
     console.log("[skip] 管理者のメッセージ");
@@ -124,4 +228,5 @@ app.listen(PORT, () => {
   console.log(`line-group-bot running on port ${PORT}`);
   console.log(`SPREADSHEET_ID: ${process.env.SPREADSHEET_ID || "(未設定)"}`);
   console.log(`ADMIN_USER_ID: ${process.env.ADMIN_USER_ID || "(未設定 — 全メッセージに反応します)"}`);
+  console.log(`GOOGLE_PLACES_API_KEY: ${process.env.GOOGLE_PLACES_API_KEY ? "設定済み（無料GBP診断 有効）" : "(未設定 — 無料GBP診断は動きません)"}`);
 });
