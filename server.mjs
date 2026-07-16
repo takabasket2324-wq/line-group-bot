@@ -103,7 +103,9 @@ async function handleDiagnose(event, userId, text) {
   }
 
   // 簡易レートリミット（1ユーザー1日3回・Places課金/API消費の暴走防止）
-  if (!consumeDiagQuota(userId)) {
+  // 管理者（ADMIN_USER_ID）は無制限：デモ・検証で社長が止まらないように除外
+  const isAdmin = !!process.env.ADMIN_USER_ID && userId === process.env.ADMIN_USER_ID;
+  if (!isAdmin && !consumeDiagQuota(userId)) {
     await client.replyMessage({
       replyToken: event.replyToken,
       messages: [{ type: "text", text:
