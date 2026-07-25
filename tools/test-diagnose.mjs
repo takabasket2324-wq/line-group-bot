@@ -11,13 +11,23 @@
 
 import { scoreGbp, MOCK_TONSOKU } from "../lib/gbp.mjs";
 import { buildSummary, runDiagnosis } from "../lib/diagnose.mjs";
-import { consumeDiagQuota } from "../lib/ratelimit.mjs";
+// ratelimit.mjs は保存先を DIAG_USAGE_FILE で切り替えてから動的 import する（下記）
 
-// --- 1) レートリミット単体テスト（メモリ内・課金ゼロ） ---
-console.log("=== レートリミット（1日3回） ===");
+// --- 1) レートリミット単体テスト（課金ゼロ） ---
+// 詳細（日次/月次上限・日付リセット・永続化）は tools/test-ratelimit.mjs で確認する。
+// ここでは煙テストのみ。※本番カウント（data/diag-usage.json）を汚さないよう一時ファイルへ。
+if (!process.env.DIAG_USAGE_FILE) {
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  process.env.DIAG_USAGE_FILE = join(mkdtempSync(join(tmpdir(), "diag-test-")), "usage.json");
+}
+const { consumeDiagQuota } = await import("../lib/ratelimit.mjs");
+console.log("=== レートリミット（同一ユーザー1日3回） ===");
 const results = [1, 2, 3, 4].map(() => consumeDiagQuota("test-user"));
-console.log(`1〜4回目: ${results.join(", ")}（期待: true, true, true, false）`);
-if (JSON.stringify(results) !== JSON.stringify([true, true, true, false])) {
+const marks = results.map((r) => (r.ok ? "ok" : r.reason));
+console.log(`1〜4回目: ${marks.join(", ")}（期待: ok, ok, ok, user_daily）`);
+if (JSON.stringify(marks) !== JSON.stringify(["ok", "ok", "ok", "user_daily"])) {
   console.error("❌ レートリミットが期待どおりではありません");
   process.exit(1);
 }

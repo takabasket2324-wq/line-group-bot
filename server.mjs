@@ -11,7 +11,7 @@ import { join, dirname } from "path";
 import { generateReply } from "./lib/ai.mjs";
 import { fetchSystemPrompt, fetchKnowledge, fetchHistory, appendHistory, appendDiagnosisLead, recordConsultContact } from "./lib/sheets.mjs";
 import { runDiagnosis } from "./lib/diagnose.mjs";
-import { consumeDiagQuota, DIAG_DAILY_LIMIT } from "./lib/ratelimit.mjs";
+import { consumeDiagQuota, getDiagUsage, DIAG_USER_DAILY_LIMIT } from "./lib/ratelimit.mjs";
 import {
   markAwaitingContact, isAwaitingContact, clearAwaitingContact,
   CONSULT_ASK_CONTACT, CONSULT_THANKS, buildAdminNotify,
@@ -39,7 +39,8 @@ app.get("/", (req, res) => {
 app.get("/health", (req, res) => {
   res.json({ status: "ok", bot: "line-group-bot", diag: true, consult: true,
     places_key: !!process.env.GOOGLE_PLACES_API_KEY,
-    admin_user: !!process.env.ADMIN_USER_ID });
+    admin_user: !!process.env.ADMIN_USER_ID,
+    diag_usage: getDiagUsage() });
 });
 
 app.post("/webhook", middleware(config), async (req, res) => {
@@ -102,17 +103,31 @@ async function handleDiagnose(event, userId, text) {
     return;
   }
 
-  // 簡易レートリミット（1ユーザー1日3回・Places課金/API消費の暴走防止）
+  // レートリミット（Places課金/API消費の暴走防止・data/diag-usage.json に永続化）
+  //  ① 同一ユーザー1日N回 ② 全体の日次上限 ③ 全体の月次上限（lib/ratelimit.mjs）
   // 管理者（ADMIN_USER_ID）は無制限：デモ・検証で社長が止まらないように除外
   const isAdmin = !!process.env.ADMIN_USER_ID && userId === process.env.ADMIN_USER_ID;
-  if (!isAdmin && !consumeDiagQuota(userId)) {
-    await client.replyMessage({
-      replyToken: event.replyToken,
-      messages: [{ type: "text", text:
-        `無料診断は1日${DIAG_DAILY_LIMIT}回までとさせていただいています🙏\n` +
-        "明日また試していただくか、詳しい診断をご希望でしたら『相談したい』とご返信ください。" }],
-    });
-    return;
+  if (!isAdmin) {
+    const quota = consumeDiagQuota(userId);
+    if (!quota.ok) {
+      const limitText = {
+        user_daily:
+          `無料診断は1日${DIAG_USER_DAILY_LIMIT}回までとさせていただいています🙏\n` +
+          "明日また試していただくか、詳しい診断をご希望でしたら『相談したい』とご返信ください。",
+        global_daily:
+          "本日の無料診断の受付枠が埋まりました🙏\n" +
+          "明日あらためてお試しいただくか、お急ぎでしたらこのLINEにそのままメッセージをください。",
+        global_monthly:
+          "今月の無料診断の受付枠が埋まりました🙏\n" +
+          "来月あらためてお試しいただくか、お急ぎでしたらこのLINEにそのままメッセージをください。",
+      }[quota.reason];
+      console.log(`[diagnose limit] user=${userId} reason=${quota.reason}`);
+      await client.replyMessage({
+        replyToken: event.replyToken,
+        messages: [{ type: "text", text: limitText }],
+      });
+      return;
+    }
   }
 
   // すぐに受付返信（診断はPlaces API 2コールで数秒かかる）
