@@ -16,6 +16,11 @@ import {
   markAwaitingContact, isAwaitingContact, clearAwaitingContact,
   CONSULT_ASK_CONTACT, CONSULT_THANKS, buildAdminNotify,
 } from "./lib/consult.mjs";
+import {
+  REFERRAL_QUESTION, REFERRAL_THANKS,
+  markAwaitingReferral, isAwaitingReferral,
+  parseReferralAnswer, recordReferralAnswer, getReferralStats,
+} from "./lib/referral.mjs";
 
 const PROJECT_ROOT = dirname(import.meta.url.replace("file://", ""));
 dotenv.config({ path: join(PROJECT_ROOT, ".env") });
@@ -40,7 +45,8 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", bot: "line-group-bot", diag: true, consult: true,
     places_key: !!process.env.GOOGLE_PLACES_API_KEY,
     admin_user: !!process.env.ADMIN_USER_ID,
-    diag_usage: getDiagUsage() });
+    diag_usage: getDiagUsage(),
+    referral: getReferralStats() });
 });
 
 app.post("/webhook", middleware(config), async (req, res) => {
@@ -84,9 +90,24 @@ const DIAG_GUIDE = [
 
 async function handleFollow(event) {
   console.log(`[follow] user=${event.source.userId}`);
+  // 先に「アンケート回答待ち」に登録（送信が失敗しても状態は残す）
+  markAwaitingReferral(event.source.userId);
   await client.replyMessage({
     replyToken: event.replyToken,
-    messages: [{ type: "text", text: FOLLOW_GREETING }],
+    messages: [
+      { type: "text", text: FOLLOW_GREETING },
+      { type: "text", text: REFERRAL_QUESTION }, // 流入元アンケート（1通で2メッセージ）
+    ],
+  });
+}
+
+// 流入元アンケートの回答を受領（記録→軽くお礼を返すだけ）
+async function handleReferralAnswer(event, userId, answerKey) {
+  const { updated } = recordReferralAnswer(userId, answerKey);
+  console.log(`[referral] user=${userId} answer=${answerKey}${updated ? " (上書き)" : ""}`);
+  await client.replyMessage({
+    replyToken: event.replyToken,
+    messages: [{ type: "text", text: REFERRAL_THANKS }],
   });
 }
 
@@ -307,6 +328,12 @@ async function handleEvent(event) {
     // 「相談」を含む返信 → AIの一般回答をせず連絡先をお願いする
     if (/相談/.test(text)) {
       return handleConsultRequest(event, userId);
+    }
+    // 流入元アンケートの回答待ち：1〜6 or キーワードなら記録。
+    // それ以外は何もせず通常フローへ（診断・相談・AI回答に一切干渉しない）
+    if (isAwaitingReferral(userId)) {
+      const answerKey = parseReferralAnswer(text);
+      if (answerKey) return handleReferralAnswer(event, userId, answerKey);
     }
   }
 
