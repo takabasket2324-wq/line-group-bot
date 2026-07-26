@@ -36,6 +36,10 @@ const client = new messagingApi.MessagingApiClient({
 
 const app = express();
 
+// 静的ファイル配信（友だち追加あいさつの診断案内画像など）
+// LINEのimageメッセージは https の公開URLが必須のため、Render経由で配信する
+app.use("/static", express.static(join(PROJECT_ROOT, "static"), { maxAge: "1d" }));
+
 app.get("/", (req, res) => {
   res.json({ status: "ok", bot: "line-group-bot" });
 });
@@ -88,16 +92,30 @@ const DIAG_GUIDE = [
   "エリア名も添えると見つかりやすいです（例：診断 ○○食堂 難波）",
 ].join("\n");
 
+// 診断案内の図解画像（friends追加あいさつに添える）
+// originalContentUrl/previewImageUrl とも https 必須。約500KB なので両方同じ画像でOK
+// （LINE上限：original 10MB / preview 1MB）
+const PUBLIC_BASE_URL =
+  process.env.PUBLIC_BASE_URL || "https://line-group-bot-c7gk.onrender.com";
+const FOLLOW_IMAGE_URL = `${PUBLIC_BASE_URL}/static/shindan-guide.png`;
+
+// followあいさつの3メッセージ（①挨拶 ②診断案内画像 ③流入元アンケート）
+// ※1回のreplyMessageで5件まで送れるので1通にまとめる
+export function buildFollowMessages() {
+  return [
+    { type: "text", text: FOLLOW_GREETING },
+    { type: "image", originalContentUrl: FOLLOW_IMAGE_URL, previewImageUrl: FOLLOW_IMAGE_URL },
+    { type: "text", text: REFERRAL_QUESTION },
+  ];
+}
+
 async function handleFollow(event) {
   console.log(`[follow] user=${event.source.userId}`);
   // 先に「アンケート回答待ち」に登録（送信が失敗しても状態は残す）
   markAwaitingReferral(event.source.userId);
   await client.replyMessage({
     replyToken: event.replyToken,
-    messages: [
-      { type: "text", text: FOLLOW_GREETING },
-      { type: "text", text: REFERRAL_QUESTION }, // 流入元アンケート（1通で2メッセージ）
-    ],
+    messages: buildFollowMessages(),
   });
 }
 
