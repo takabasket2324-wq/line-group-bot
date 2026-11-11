@@ -8,7 +8,8 @@ import express from "express";
 import { messagingApi, middleware } from "@line/bot-sdk";
 import dotenv from "dotenv";
 import { join, dirname } from "path";
-import { generateReply } from "./lib/ai.mjs";
+import { generateReply, pingClaude } from "./lib/ai.mjs";
+import { createSelftest, publicView } from "./lib/selftest.mjs";
 import { fetchSystemPrompt, fetchKnowledge, fetchHistory, appendHistory, appendDiagnosisLead, recordConsultContact } from "./lib/sheets.mjs";
 import { runDiagnosis } from "./lib/diagnose.mjs";
 import { consumeDiagQuota, getDiagUsage, DIAG_USER_DAILY_LIMIT } from "./lib/ratelimit.mjs";
@@ -52,6 +53,40 @@ app.get("/health", (req, res) => {
     diag_usage: getDiagUsage(),
     referral: getReferralStats() });
 });
+
+// ---------------------------------------------------------------------------
+// 無料診断の見張り（lib/selftest.mjs）
+// /selftest を開くと、期限（20時間・落ちている間は1時間）が来ていれば本物の道を通して確かめる。
+// 期限前は前の結果を返すだけ＝誰が何回開いても Places の回数は増えない。
+// 外の見張りサービスが定期で開き、HTTP 500 なら上田さんのメールへ知らせる想定。
+// ---------------------------------------------------------------------------
+const selftest = createSelftest({
+  line: client,
+  runDiagnosis,
+  readSheet: fetchSystemPrompt,
+  pingClaude,
+  notify: async (text) => {
+    if (!process.env.ADMIN_USER_ID) throw new Error("ADMIN_USER_ID 未設定");
+    await client.pushMessage({ to: process.env.ADMIN_USER_ID, messages: [{ type: "text", text }] });
+  },
+});
+
+app.get("/selftest", async (req, res) => {
+  try {
+    const r = await selftest.run();
+    res.status(r.ok ? 200 : 500).json(publicView(r));
+  } catch (err) {
+    console.error("[selftest route error]", err.message);
+    res.status(500).json({ ok: false, error: "selftest_crashed" });
+  }
+});
+
+// 起きている間は1時間ごとにも期限を見る（外の見張りが無くても、起きていれば1日1回は確かめる）
+if (!process.env.SELFTEST_DISABLE_TIMER) {
+  setInterval(() => {
+    selftest.run().catch((err) => console.error("[selftest timer error]", err.message));
+  }, 3600e3).unref();
+}
 
 app.post("/webhook", middleware(config), async (req, res) => {
   res.status(200).json({ status: "ok" });
